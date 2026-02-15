@@ -13,6 +13,10 @@ from openai import OpenAI
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
+# Grupo onde o resumo será enviado automaticamente
+TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "").strip()
+TARGET_THREAD_ID = os.getenv("TARGET_THREAD_ID", "").strip()
+
 if not BOT_TOKEN or not OPENAI_API_KEY:
     raise RuntimeError("Defina BOT_TOKEN e OPENAI_API_KEY nas variáveis do Railway")
 
@@ -50,7 +54,6 @@ def save_message(chat_id: int, thread_id: int | None, user_name: str, text: str)
 
 
 def parse_date_from_text(txt: str) -> date | None:
-    # aceita dd/mm/aaaa ou dd-mm-aaaa
     m = re.search(r"(\d{2})[\/\-](\d{2})[\/\-](\d{4})", txt)
     if not m:
         return None
@@ -64,7 +67,6 @@ def fetch_messages_for_day(chat_id: int, thread_id: int | None, d: date, limit: 
 
     conn = sqlite3.connect(DB_PATH)
 
-    # Se thread_id existir (tópicos), filtra pelo tópico também
     if thread_id is None:
         cur = conn.execute(
             """
@@ -133,15 +135,24 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Comandos:\n"
         "/id  → mostra chat_id e thread_id\n"
         "/resumo  → resumo de hoje (do tópico atual)\n"
-        "/resumo 12/02/2026 → resumo de uma data\n"
+        "/resumo 12/02/2026 → resumo de uma data\n\n"
+        "Obs: quando você pedir /resumo, eu também envio para o grupo de Resumo (se TARGET_CHAT_ID estiver configurado)."
     )
 
 
-# ✅ PASSO A: pegar o ID do grupo B
 async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    thread_id = update.effective_message.message_thread_id  # None se não for tópico
+    thread_id = update.effective_message.message_thread_id
     await update.message.reply_text(f"chat_id: {chat_id}\nthread_id: {thread_id}")
+
+
+async def send_to_target(ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    if not TARGET_CHAT_ID:
+        return
+    kwargs = {}
+    if TARGET_THREAD_ID:
+        kwargs["message_thread_id"] = int(TARGET_THREAD_ID)
+    await ctx.bot.send_message(chat_id=int(TARGET_CHAT_ID), text=text, **kwargs)
 
 
 async def cmd_resumo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -149,10 +160,9 @@ async def cmd_resumo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     d = parse_date_from_text(txt) or datetime.now(TZ).date()
 
     chat_id = update.effective_chat.id
-    thread_id = update.effective_message.message_thread_id  # tópico atual (ou None)
+    thread_id = update.effective_message.message_thread_id
 
     rows = fetch_messages_for_day(chat_id, thread_id, d)
-
     if not rows:
         await update.message.reply_text("Não encontrei mensagens nesse dia (neste tópico).")
         return
@@ -163,7 +173,12 @@ async def cmd_resumo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     resp = client.responses.create(model="gpt-4.1-mini", input=prompt)
     out = (resp.output_text or "").strip() or "Resumo vazio (não retornou texto)."
 
+    # Responde onde você pediu
     await update.message.reply_text(out)
+
+    # E envia para o Grupo do Resumo
+    header = f"📌 Resumo do dia {d.strftime('%d/%m/%Y')} (tópico atual)\n"
+    await send_to_target(ctx, header + "\n" + out)
 
 
 # ====== CAPTURAR MENSAGENS ======
@@ -172,7 +187,7 @@ async def capture(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
-    thread_id = update.message.message_thread_id  # None se fora de tópico
+    thread_id = update.message.message_thread_id
 
     user_name = "SemNome"
     if update.message.from_user:
@@ -186,12 +201,9 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # ✅ No main(): adicionando o /id (Passo A)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("resumo", cmd_resumo))
-
-    # captura texto normal
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture))
 
     app.run_polling()
