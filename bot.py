@@ -21,7 +21,7 @@ from openai import OpenAI
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-# Grupo "Resumo RGL" (onde fica o painel e onde o resumo é enviado)
+# Grupo "Resumo RGL" (painel e destino dos resumos)
 TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "").strip()
 
 # (Opcional) tópico específico dentro do grupo Resumo RGL
@@ -124,16 +124,6 @@ def get_alias(chat_id: int, thread_id: int):
     row = cur.fetchone()
     conn.close()
     return row[0] if row else None
-
-def set_alias(chat_id: int, thread_id: int, alias: str):
-    conn = db_conn()
-    conn.execute("""
-        INSERT INTO topic_alias(chat_id, thread_id, alias)
-        VALUES(?,?,?)
-        ON CONFLICT(chat_id, thread_id) DO UPDATE SET alias=excluded.alias
-    """, (chat_id, thread_id, alias))
-    conn.commit()
-    conn.close()
 
 def list_threads_in_chat_for_day(chat_id: int, d: date):
     start, end = day_range(d)
@@ -313,7 +303,6 @@ def kb_mode(chat_id: int):
     ])
 
 def kb_date_choice(mode: str, chat_id: int):
-    # mode: "gen" ou "topics"
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("Hoje", callback_data=f"date:{mode}:{chat_id}:today"),
@@ -367,30 +356,6 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Tópicos vistos: {topicos}\n"
         f"Mensagens gravadas: {msgs}\n\n"
         "Obs: o bot só conta o que chegou DEPOIS que ele ficou online."
-    )
-
-async def cmd_alias(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # /apelido_topico <thread_id> <apelido>
-    if update.effective_chat.id != int(TARGET_CHAT_ID):
-        # permitir também usar em grupos normais se você quiser; aqui vamos bloquear pra manter simples
-        await update.message.reply_text("Use este comando no Resumo RGL.")
-        return
-    if not is_admin_user(update):
-        await update.message.reply_text("Sem permissão.")
-        return
-
-    parts = (update.message.text or "").split(maxsplit=2)
-    if len(parts) < 3:
-        await update.message.reply_text("Use: /apelido_topico <thread_id> <apelido>")
-        return
-    tid = int(parts[1])
-    alias = parts[2].strip()
-    # apelido só faz sentido por grupo; como você escolhe o grupo no painel,
-    # este comando fica opcional e não é essencial. Mantendo simples:
-    await update.message.reply_text(
-        "✅ Apelido recebido.\n\n"
-        "⚠️ Neste modelo, apelidos por tópico são por GRUPO.\n"
-        "Se quiser, eu adiciono um botão no painel pra definir apelido no grupo escolhido."
     )
 
 
@@ -491,7 +456,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Resumo por TÓPICO — escolha a data:", reply_markup=kb_date_choice("topics", chat_id))
         return
 
-    # Date handling
     m = re.match(r"^date:(gen|topics):(-?\d+):(today|yest|pick)$", data)
     if m:
         mode = m.group(1)
@@ -528,9 +492,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # Pick a topic for that date
     if data.startswith("picktid:"):
-        # picktid:<chat_id>:<tid>:<iso-date>
         parts = data.split(":")
         chat_id = int(parts[1])
         tid = int(parts[2])
@@ -545,9 +507,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # =======================
-# DATE INPUT IN RESUMO RGL (when user types dd/mm/yyyy)
+# DATE INPUT (ONLY Resumo RGL)  ✅✅✅ CORREÇÃO AQUI
 # =======================
 async def on_text_in_resumo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # só trata texto no Resumo RGL
     if update.effective_chat.id != int(TARGET_CHAT_ID):
         return
     if not is_admin_user(update):
@@ -599,7 +562,7 @@ async def capture(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
 
-    # NUNCA salvar mensagens do Resumo RGL (painel)
+    # nunca salvar mensagens do Resumo RGL (painel)
     if str(chat_id) == str(TARGET_CHAT_ID):
         return
 
@@ -624,13 +587,14 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("apelido_topico", cmd_alias))
 
     # botões
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    # texto digitado no Resumo RGL para data DD/MM/AAAA
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_in_resumo))
+    # ✅✅✅ CORREÇÃO: este handler roda SOMENTE no chat Resumo RGL
+    app.add_handler(
+        MessageHandler(filters.Chat(int(TARGET_CHAT_ID)) & filters.TEXT & ~filters.COMMAND, on_text_in_resumo)
+    )
 
     # captura geral em grupos (menos Resumo RGL)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture))
