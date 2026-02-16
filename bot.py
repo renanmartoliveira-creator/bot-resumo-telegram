@@ -12,9 +12,10 @@ from telegram.ext import (
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))  # chat_id do "Resumo RGL"
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
 
 TZ = timezone(timedelta(hours=-3))
 
@@ -28,24 +29,39 @@ def db():
 def init_db():
     conn = db()
     cur = conn.cursor()
+
+    # 1) cria tabela (se não existir)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS messages (
-        id SERIAL PRIMARY KEY,
-        chat_id BIGINT,
-        chat_title TEXT,
-        thread_id BIGINT,
-        user_id BIGINT,
-        user_name TEXT,
-        text TEXT,
-        created TIMESTAMP
+        id SERIAL PRIMARY KEY
     )
     """)
     conn.commit()
+
+    # 2) migração: adiciona colunas que podem estar faltando
+    # (Isso resolve exatamente seu erro do chat_title)
+    cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS chat_id BIGINT")
+    cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS chat_title TEXT")
+    cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS thread_id BIGINT")
+    cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS user_id BIGINT")
+    cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS user_name TEXT")
+    cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS text TEXT")
+    cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS created TIMESTAMP")
+    conn.commit()
+
     conn.close()
 
 
 def save_message(update: Update):
     if not update.message or not update.message.text:
+        return
+
+    # grava só mensagens de group/supergroup (inclusive tópicos)
+    if not update.effective_chat or update.effective_chat.type not in ("group", "supergroup"):
+        return
+
+    # não grava o próprio Resumo RGL (pra não poluir)
+    if update.effective_chat.id == TARGET_CHAT_ID:
         return
 
     conn = db()
@@ -61,7 +77,7 @@ def save_message(update: Update):
         update.effective_user.id if update.effective_user else None,
         update.effective_user.full_name if update.effective_user else "SemNome",
         update.message.text,
-        datetime.now(TZ)
+        datetime.now(TZ),
     ))
 
     conn.commit()
@@ -73,9 +89,10 @@ def save_message(update: Update):
 def parse_date_token(token: str):
     token = (token or "").strip().lower()
 
-    if token in ("hoje",):
+    if token == "hoje":
         return datetime.now(TZ).date()
-    if token in ("ontem",):
+
+    if token == "ontem":
         return (datetime.now(TZ) - timedelta(days=1)).date()
 
     try:
@@ -96,7 +113,6 @@ def extract_arg_from_text(msg_text: str):
     parts = msg_text.strip().split()
     if len(parts) < 2:
         return None
-    # parts[0] é o comando (/relatorio ou /relatorio@bot)
     return parts[1]
 
 
@@ -105,7 +121,6 @@ def is_target_chat(update: Update):
 
 
 async def safe_reply(update: Update, text: str):
-    # manda resposta no mesmo tópico (se existir)
     await update.message.reply_text(text[:4000])
 
 
@@ -114,16 +129,18 @@ async def safe_reply(update: Update, text: str):
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_target_chat(update):
         return
+
     await safe_reply(
         update,
-        "🤖 Online.\n\nUse:\n"
+        "🤖 Online.\n\n"
+        "Use:\n"
         "/relatorio hoje\n"
         "/relatorio ontem\n"
         "/relatorio DD/MM/AAAA\n\n"
-        "Dica (quando tem vários bots):\n"
+        "Dica (se tiver vários bots):\n"
         "/relatorio@resumoequipe_bot hoje\n\n"
-        "/status para ver contagens.\n"
-        "/ping para testar rápido."
+        "/status para contagens.\n"
+        "/ping para teste rápido."
     )
 
 
@@ -140,10 +157,10 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     conn = db()
     cur = conn.cursor()
 
-    cur.execute("SELECT COUNT(DISTINCT chat_id) FROM messages")
+    cur.execute("SELECT COUNT(DISTINCT chat_id) FROM messages WHERE chat_id IS NOT NULL")
     groups = cur.fetchone()[0] or 0
 
-    cur.execute("SELECT COUNT(DISTINCT (chat_id, thread_id)) FROM messages")
+    cur.execute("SELECT COUNT(DISTINCT (chat_id, thread_id)) FROM messages WHERE chat_id IS NOT NULL")
     topics = cur.fetchone()[0] or 0
 
     cur.execute("SELECT COUNT(*) FROM messages")
@@ -151,23 +168,14 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     conn.close()
 
-    await safe_reply(
-        update,
-        f"📊 Status\n\nGrupos: {groups}\nTópicos: {topics}\nMensagens: {msgs}"
-    )
+    await safe_reply(update, f"📊 Status\n\nGrupos: {groups}\nTópicos: {topics}\nMensagens: {msgs}")
 
 
 async def relatorio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_target_chat(update):
         return
 
-    # pega argumento tanto de ctx.args quanto do texto cru
-    token = None
-    if ctx.args:
-        token = ctx.args[0]
-    else:
-        token = extract_arg_from_text(update.message.text)
-
+    token = ctx.args[0] if ctx.args else extract_arg_from_text(update.message.text)
     if not token:
         await safe_reply(update, "Use: /relatorio hoje | ontem | DD/MM/AAAA")
         return
@@ -223,12 +231,7 @@ async def relatorio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------------- CAPTURE ----------------
 
 async def capture(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # grava mensagens de todos os grupos/supergrupos (inclusive tópicos)
-    if update.effective_chat and update.effective_chat.type in ("group", "supergroup"):
-        # não grava mensagens do próprio Resumo RGL (pra não poluir)
-        if update.effective_chat.id == TARGET_CHAT_ID:
-            return
-        save_message(update)
+    save_message(update)
 
 
 # ---------------- MAIN ----------------
